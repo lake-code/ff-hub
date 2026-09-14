@@ -9,7 +9,7 @@
 //   ESPN_SWID the SWID cookie value, braces included: {ABC-123-...}
 //
 // Request:  /api/espn?leagueId=123456&season=2026&week=2
-// Response: normalized league object (see bottom of file for the shape)
+// Response: normalized league object
 
 const LINEUP_SLOT = {
   0: 'QB', 1: 'QB', 2: 'RB', 3: 'RB/WR', 4: 'WR', 5: 'WR/TE', 6: 'TE',
@@ -41,6 +41,47 @@ function teamName(team) {
   return parts.length ? parts.join(' ') : `Team ${team.id}`;
 }
 
+function playerName(player) {
+  if (!player) return '';
+  if (player.fullName) return player.fullName;
+  const parts = [player.firstName, player.lastName].filter(Boolean);
+  return parts.join(' ');
+}
+
+// Depending on which views ESPN decides to honour, the player object hanging
+// off a matchup entry is sometimes just an id and a score. The team rosters
+// carry the full record, so index everything we see once and let entries fall
+// back to it.
+function buildPlayerIndex(data) {
+  const index = {};
+
+  const add = (player) => {
+    if (!player || player.id == null) return;
+    const name = playerName(player);
+    if (!name) return;
+    const existing = index[player.id];
+    index[player.id] = {
+      name,
+      defaultPositionId: player.defaultPositionId ?? existing?.defaultPositionId,
+      proTeamId: player.proTeamId ?? existing?.proTeamId,
+      injuryStatus: player.injuryStatus ?? existing?.injuryStatus,
+    };
+  };
+
+  for (const team of data.teams || []) {
+    for (const entry of team.roster?.entries || []) add(entry?.playerPoolEntry?.player);
+  }
+  for (const matchup of data.schedule || []) {
+    for (const side of [matchup.home, matchup.away]) {
+      for (const entry of side?.rosterForCurrentScoringPeriod?.entries || []) {
+        add(entry?.playerPoolEntry?.player);
+      }
+    }
+  }
+
+  return index;
+}
+
 function statFor(player, week, sourceId) {
   const stats = player?.stats || [];
   const hit = stats.find(
@@ -49,26 +90,37 @@ function statFor(player, week, sourceId) {
   return hit ? round(hit.appliedTotal) : 0;
 }
 
-function mapEntry(entry, week) {
+function mapEntry(entry, week, index) {
   const player = entry?.playerPoolEntry?.player || {};
+  const backup = index[entry?.playerId] || index[player.id] || {};
   const slotId = entry?.lineupSlotId;
+
+  const name =
+    playerName(player) ||
+    backup.name ||
+    (entry?.playerId ? `Player ${entry.playerId}` : 'Empty slot');
+
+  const positionId = player.defaultPositionId ?? backup.defaultPositionId;
+  const proTeamId = player.proTeamId ?? backup.proTeamId;
+  const injury = player.injuryStatus ?? backup.injuryStatus;
+
   return {
     slot: LINEUP_SLOT[slotId] ?? '',
     starter: !BENCH_SLOTS.has(slotId),
-    name: player.fullName || 'Empty',
-    position: POSITION[player.defaultPositionId] || '',
-    proTeam: PRO_TEAM[player.proTeamId] || '',
-    injury: player.injuryStatus && player.injuryStatus !== 'ACTIVE' ? player.injuryStatus : null,
+    name,
+    position: POSITION[positionId] || '',
+    proTeam: PRO_TEAM[proTeamId] || '',
+    injury: injury && injury !== 'ACTIVE' ? injury : null,
     points: round(entry?.playerPoolEntry?.appliedStatTotal ?? statFor(player, week, 0)),
     projected: statFor(player, week, 1),
   };
 }
 
-function sideFrom(side, teams, week) {
+function sideFrom(side, teams, week, index) {
   if (!side) return null;
   const team = teams[side.teamId];
   const entries = side.rosterForCurrentScoringPeriod?.entries || [];
-  const roster = entries.map((e) => mapEntry(e, week)).sort((a, b) => {
+  const roster = entries.map((e) => mapEntry(e, week, index)).sort((a, b) => {
     if (a.starter !== b.starter) return a.starter ? -1 : 1;
     return b.points - a.points;
   });
@@ -83,8 +135,6 @@ function sideFrom(side, teams, week) {
     logo: team?.logo || null,
     isMine: Boolean(team?.isMine),
     record: team?.record || null,
-    // totalPoints is authoritative once a week is final; the live sum is
-    // fresher while games are in progress.
     score: round(side.totalPoints || liveScore || 0),
     projected: round(starters.reduce((sum, p) => sum + (p.projected || 0), 0)),
     roster,
@@ -103,10 +153,12 @@ export default async function handler(req, res) {
   const swid = process.env.ESPN_SWID || '';
   const s2 = process.env.ESPN_S2 || '';
 
+  // mBoxscore is what makes ESPN return full player records inside the
+  // matchup rosters. Without it you get ids and points but no names.
   const url =
     `https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/${year}` +
     `/segments/0/leagues/${leagueId}` +
-    `?view=mMatchupScore&view=mTeam&view=mRoster&view=mSettings` +
+    `?view=mMatchupScore&view=mBoxscore&view=mTeam&view=mRoster&view=mSettings` +
     `&scoringPeriodId=${scoringPeriod}`;
 
   try {
@@ -130,8 +182,8 @@ export default async function handler(req, res) {
     }
 
     const data = await espn.json();
+    const index = buildPlayerIndex(data);
 
-    // Which team is mine: ESPN lists owner SWIDs on each team.
     const mySwid = swid.replace(/[{}]/g, '').toLowerCase();
     const teams = {};
     for (const team of data.teams || []) {
@@ -149,12 +201,11 @@ export default async function handler(req, res) {
     const matchups = (data.schedule || [])
       .filter((m) => m.matchupPeriodId === scoringPeriod)
       .map((m) => ({
-        home: sideFrom(m.home, teams, scoringPeriod),
-        away: sideFrom(m.away, teams, scoringPeriod),
+        home: sideFrom(m.home, teams, scoringPeriod, index),
+        away: sideFrom(m.away, teams, scoringPeriod, index),
       }))
       .filter((m) => m.home && m.away);
 
-    // Cache briefly so rapid refreshes during games do not hammer ESPN.
     res.setHeader('Cache-Control', 's-maxage=30, stale-while-revalidate=60');
 
     return res.status(200).json({
