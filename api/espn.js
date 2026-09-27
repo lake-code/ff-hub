@@ -128,6 +128,7 @@ function mapEntry(entry, week, index) {
     slot: LINEUP_SLOT[slotId] ?? '',
     slotId,
     starter: !BENCH_SLOTS.has(slotId),
+    playerId: entry?.playerId ?? player.id ?? null,
     name,
     position: POSITION[positionId] || '',
     proTeam: PRO_TEAM[proTeamId] || '',
@@ -164,6 +165,7 @@ function sideFrom(side, teams, week, index) {
     abbrev: team?.abbrev || '',
     logo: team?.logo || null,
     isMine: Boolean(team?.isMine),
+    owner: team?.owner || null,
     record: team?.record || null,
     score: round(side.totalPoints || liveScore || 0),
     projected: round(starters.reduce((sum, p) => sum + (p.projected || 0), 0)),
@@ -214,6 +216,16 @@ export default async function handler(req, res) {
     const data = await espn.json();
     const index = buildPlayerIndex(data);
 
+    // League members carry the human names behind each team's owner SWIDs.
+    const memberNames = {};
+    for (const member of data.members || []) {
+      const id = String(member?.id || '').replace(/[{}]/g, '').toLowerCase();
+      const name =
+        member?.displayName ||
+        [member?.firstName, member?.lastName].filter(Boolean).join(' ');
+      if (id && name) memberNames[id] = name;
+    }
+
     const mySwid = swid.replace(/[{}]/g, '').toLowerCase();
     const teams = {};
     for (const team of data.teams || []) {
@@ -221,9 +233,10 @@ export default async function handler(req, res) {
       teams[team.id] = {
         ...team,
         isMine: mySwid ? owners.includes(mySwid) : false,
+        owner: owners.map((o) => memberNames[o]).filter(Boolean)[0] || null,
         record: team.record?.overall
-          ? `${team.record.overall.wins}-${team.record.overall.losses}` +
-            (team.record.overall.ties ? `-${team.record.overall.ties}` : '')
+          ? `${team.record.overall.wins || 0}-${team.record.overall.losses || 0}` +
+            `-${team.record.overall.ties || 0}`
           : null,
       };
     }
