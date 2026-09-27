@@ -18,6 +18,26 @@ const LINEUP_SLOT = {
   20: 'Bench', 21: 'IR', 22: '', 23: 'FLEX', 24: 'ER',
 };
 
+// Starters read in lineup order, not scoring order: QB, RB, RB, WR, WR, TE,
+// FLEX, D/ST, K. Anything not listed sorts after the named slots but still
+// ahead of the bench.
+const SLOT_ORDER = {
+  0: 10,   // QB
+  1: 10,   // QB (team QB)
+  2: 20,   // RB
+  3: 25,   // RB/WR
+  4: 30,   // WR
+  5: 35,   // WR/TE
+  6: 40,   // TE
+  23: 50,  // FLEX
+  7: 55,   // OP (superflex)
+  16: 60,  // D/ST
+  17: 70,  // K
+  18: 75,  // P
+  19: 80,  // HC
+};
+
+const DEFAULT_ORDER = 90;
 const POSITION = { 1: 'QB', 2: 'RB', 3: 'WR', 4: 'TE', 5: 'K', 16: 'D/ST' };
 
 const PRO_TEAM = {
@@ -106,6 +126,7 @@ function mapEntry(entry, week, index) {
 
   return {
     slot: LINEUP_SLOT[slotId] ?? '',
+    slotId,
     starter: !BENCH_SLOTS.has(slotId),
     name,
     position: POSITION[positionId] || '',
@@ -120,8 +141,17 @@ function sideFrom(side, teams, week, index) {
   if (!side) return null;
   const team = teams[side.teamId];
   const entries = side.rosterForCurrentScoringPeriod?.entries || [];
+
   const roster = entries.map((e) => mapEntry(e, week, index)).sort((a, b) => {
+    // Starters first, then by lineup slot. Array.prototype.sort is stable, so
+    // two players in the same slot keep the order ESPN sent them in.
     if (a.starter !== b.starter) return a.starter ? -1 : 1;
+    if (a.starter) {
+      const rankA = SLOT_ORDER[a.slotId] ?? DEFAULT_ORDER;
+      const rankB = SLOT_ORDER[b.slotId] ?? DEFAULT_ORDER;
+      return rankA - rankB;
+    }
+    // The bench has no meaningful slot order, so show the big scores first.
     return b.points - a.points;
   });
 
